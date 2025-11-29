@@ -1,0 +1,332 @@
+#' Generate Contour Lines from Raster Data
+#'
+#' @param raster_obj Raster object (terra SpatRaster, raster RasterLayer, or stars object)
+#' @param breaks Either numeric vector of break values or NULL
+#' @param n.breaks Integer, number of breaks to generate (used if breaks is NULL)
+#' @param bbox Bounding box as numeric vector c(xmin, ymin, xmax, ymax) or sf/terra object with extent
+#' @param method Method for contour generation: "terra" (default), "raster", or "stars"
+#' @param return_format Output format: "sf" (default), "sp", or "terra"
+#' @param pretty_breaks Logical, use pretty breaks (default TRUE)
+#' @param min_value Minimum value for contours (optional)
+#' @param max_value Maximum value for contours (optional)
+#' @param nlevels Alternative to n.breaks (for compatibility)
+#'
+#' @return Contour lines as sf, SpatVector, or SpatialLinesDataFrame object
+#' @export
+#'
+#' @examples
+#' \dontrun{
+#' # Example 1: Basic usage with automatic breaks
+#' contours <- create_contours(DEM, n.breaks = 10)
+#' 
+#' # Example 2: Specific break values
+#' contours <- create_contours(DEM, breaks = seq(0, 1000, by = 100))
+#' 
+#' # Example 3: With bounding box
+#' bbox <- c(xmin = -120, ymin = 35, xmax = -115, ymax = 40)
+#' contours <- create_contours(DEM, n.breaks = 15, bbox = bbox)
+#' }
+
+create_contours <- function(raster_obj,
+                            breaks = NULL,
+                            n.breaks = 10,
+                            bbox = NULL,
+                            method = "terra",
+                            return_format = "sf",
+                            pretty_breaks = TRUE,
+                            min_value = NULL,
+                            max_value = NULL,
+                            nlevels = NULL) {
+  
+  # Load required packages
+  required_packages <- c("terra", "sf")
+  for (pkg in required_packages) {
+    if (!requireNamespace(pkg, quietly = TRUE)) {
+      stop(paste("Package", pkg, "is required but not installed."))
+    }
+  }
+  
+  # Handle nlevels parameter (alternative to n.breaks)
+  if (!is.null(nlevels)) {
+    n.breaks <- nlevels
+  }
+  
+  # ============================================================================
+  # STEP 1: Convert input raster to terra SpatRaster
+  # ============================================================================
+  
+  raster_terra <- convert_to_terra(raster_obj)
+  
+  # ============================================================================
+  # STEP 2: Handle bounding box (crop if provided)
+  # ============================================================================
+  
+  if (!is.null(bbox)) {
+    raster_terra <- crop_to_bbox(raster_terra, bbox)
+  }
+  
+  # ============================================================================
+  # STEP 3: Calculate breaks
+  # ============================================================================
+  
+  breaks_vector <- calculate_breaks(
+    raster_terra = raster_terra,
+    breaks = breaks,
+    n.breaks = n.breaks,
+    pretty_breaks = pretty_breaks,
+    min_value = min_value,
+    max_value = max_value
+  )
+  
+  # ============================================================================
+  # STEP 4: Generate contours based on selected method
+  # ============================================================================
+  
+  contours <- generate_contours_internal(
+    raster_terra = raster_terra,
+    breaks = breaks_vector,
+    method = method
+  )
+  
+  # ============================================================================
+  # STEP 5: Convert to requested output format
+  # ============================================================================
+  
+  result <- convert_output_format(contours, return_format)
+  
+  return(result)
+}
+
+
+# ==============================================================================
+# HELPER FUNCTIONS
+# ==============================================================================
+
+#' Convert various raster formats to terra SpatRaster
+#' @keywords internal
+convert_to_terra <- function(raster_obj) {
+  
+  # Check if already terra SpatRaster
+  if (inherits(raster_obj, "SpatRaster")) {
+    return(raster_obj)
+  }
+  
+  # Convert from raster package
+  if (inherits(raster_obj, c("RasterLayer", "RasterStack", "RasterBrick"))) {
+    if (!requireNamespace("raster", quietly = TRUE)) {
+      stop("Package 'raster' is needed to convert RasterLayer objects.")
+    }
+    return(terra::rast(raster_obj))
+  }
+  
+  # Convert from stars
+  if (inherits(raster_obj, "stars")) {
+    if (!requireNamespace("stars", quietly = TRUE)) {
+      stop("Package 'stars' is needed to convert stars objects.")
+    }
+    # Convert stars to terra via temporary file or direct conversion
+    temp_rast <- terra::rast(stars::st_as_stars(raster_obj))
+    return(temp_rast)
+  }
+  
+  stop("Input raster_obj must be a SpatRaster (terra), RasterLayer (raster), or stars object.")
+}
+
+
+#' Crop raster to bounding box
+#' @keywords internal
+crop_to_bbox <- function(raster_terra, bbox) {
+  
+  # Handle different bbox input types
+  if (inherits(bbox, c("sf", "sfc"))) {
+    # Extract bbox from sf object
+    bbox_vec <- as.vector(sf::st_bbox(bbox))
+    ext_obj <- terra::ext(bbox_vec[1], bbox_vec[3], bbox_vec[2], bbox_vec[4])
+    
+  } else if (inherits(bbox, "SpatVector")) {
+    # Extract extent from terra vector
+    ext_obj <- terra::ext(bbox)
+    
+  } else if (inherits(bbox, "SpatExtent")) {
+    # Already a terra extent
+    ext_obj <- bbox
+    
+  } else if (is.numeric(bbox) && length(bbox) == 4) {
+    # Numeric vector: c(xmin, ymin, xmax, ymax)
+    ext_obj <- terra::ext(bbox[1], bbox[3], bbox[2], bbox[4])
+    
+  } else {
+    stop("bbox must be a numeric vector c(xmin, ymin, xmax, ymax), sf object, or SpatVector")
+  }
+  
+  # Crop the raster
+  raster_cropped <- terra::crop(raster_terra, ext_obj)
+  
+  return(raster_cropped)
+}
+
+
+#' Calculate break values for contours
+#' @keywords internal
+calculate_breaks <- function(raster_terra, breaks, n.breaks, 
+                             pretty_breaks, min_value, max_value) {
+  
+  # If breaks are already provided, validate and return
+  if (!is.null(breaks)) {
+    if (!is.numeric(breaks) || length(breaks) < 2) {
+      stop("breaks must be a numeric vector with at least 2 values")
+    }
+    return(sort(breaks))
+  }
+  
+  # Calculate min and max from raster if not provided
+  if (is.null(min_value)) {
+    min_value <- terra::global(raster_terra, "min", na.rm = TRUE)[1, 1]
+  }
+  
+  if (is.null(max_value)) {
+    max_value <- terra::global(raster_terra, "max", na.rm = TRUE)[1, 1]
+  }
+  
+  # Generate breaks
+  if (pretty_breaks) {
+    # Use pretty breaks for nice round numbers
+    breaks_vector <- pretty(c(min_value, max_value), n = n.breaks)
+    # Filter to keep only breaks within the data range
+    breaks_vector <- breaks_vector[breaks_vector >= min_value & breaks_vector <= max_value]
+  } else {
+    # Use equal interval breaks
+    breaks_vector <- seq(min_value, max_value, length.out = n.breaks)
+  }
+  
+  return(breaks_vector)
+}
+
+
+#' Generate contours using different methods
+#' @keywords internal
+generate_contours_internal <- function(raster_terra, breaks, method) {
+  
+  if (method == "terra") {
+    # Use terra::as.contour
+    contours_vect <- terra::as.contour(raster_terra, levels = breaks)
+    # Convert to sf for consistency
+    contours_sf <- sf::st_as_sf(contours_vect)
+    
+  } else if (method == "raster") {
+    # Convert to raster package format
+    if (!requireNamespace("raster", quietly = TRUE)) {
+      stop("Package 'raster' is needed for method = 'raster'")
+    }
+    raster_obj <- raster::raster(raster_terra)
+    contours_sp <- raster::rasterToContour(raster_obj, levels = breaks)
+    contours_sf <- sf::st_as_sf(contours_sp)
+    
+  } else if (method == "stars") {
+    # Use stars + sf approach
+    if (!requireNamespace("stars", quietly = TRUE)) {
+      stop("Package 'stars' is needed for method = 'stars'")
+    }
+    stars_obj <- stars::st_as_stars(raster_terra)
+    contours_sf <- sf::st_contour(stars_obj, breaks = breaks, contour_lines = TRUE)
+    
+  } else {
+    stop("method must be one of: 'terra', 'raster', or 'stars'")
+  }
+  
+  # Ensure proper attribute naming
+  if (!"level" %in% names(contours_sf)) {
+    # Find the elevation column
+    potential_names <- c("lyr.1", "layer", "elevation", "z", "value", names(raster_terra))
+    elev_col <- intersect(potential_names, names(contours_sf))[1]
+    if (!is.na(elev_col)) {
+      names(contours_sf)[names(contours_sf) == elev_col] <- "level"
+    }
+  }
+  
+  return(contours_sf)
+}
+
+
+#' Convert contours to requested output format
+#' @keywords internal
+convert_output_format <- function(contours, return_format) {
+  
+  if (return_format == "sf") {
+    return(contours)
+    
+  } else if (return_format == "sp") {
+    if (!requireNamespace("sp", quietly = TRUE)) {
+      stop("Package 'sp' is needed for return_format = 'sp'")
+    }
+    return(as(contours, "Spatial"))
+    
+  } else if (return_format == "terra") {
+    return(terra::vect(contours))
+    
+  } else {
+    stop("return_format must be one of: 'sf', 'sp', or 'terra'")
+  }
+}
+
+
+# ==============================================================================
+# ADDITIONAL UTILITY FUNCTIONS
+# ==============================================================================
+
+#' Plot contours with elevation labels
+#' @export
+plot_contours <- function(contours, 
+                          raster_obj = NULL,
+                          add_labels = TRUE,
+                          label_interval = 2,
+                          color = "black",
+                          lwd = 1,
+                          main = "Contour Map") {
+  
+  if (!requireNamespace("sf", quietly = TRUE)) {
+    stop("Package 'sf' is needed for plotting.")
+  }
+  
+  # Plot base raster if provided
+  if (!is.null(raster_obj)) {
+    if (!inherits(raster_obj, "SpatRaster")) {
+      raster_obj <- convert_to_terra(raster_obj)
+    }
+    terra::plot(raster_obj, main = main)
+    plot(sf::st_geometry(contours), add = TRUE, col = color, lwd = lwd)
+  } else {
+    plot(sf::st_geometry(contours), main = main, col = color, lwd = lwd)
+  }
+  
+  # Add labels
+  if (add_labels && "level" %in% names(contours)) {
+    # Label every nth contour
+    label_indices <- seq(1, nrow(contours), by = label_interval)
+    labeled_contours <- contours[label_indices, ]
+    
+    # Get centroids for labels
+    centroids <- sf::st_centroid(sf::st_geometry(labeled_contours))
+    coords <- sf::st_coordinates(centroids)
+    
+    text(coords[, "X"], coords[, "Y"], 
+         labels = round(labeled_contours$level, 1),
+         cex = 0.7, col = color)
+  }
+}
+
+
+#' Smooth contour lines
+#' @export
+smooth_contours <- function(contours, smoothness = 0.5) {
+  
+  if (!requireNamespace("smoothr", quietly = TRUE)) {
+    warning("Package 'smoothr' is recommended for smoothing. Returning original contours.")
+    return(contours)
+  }
+  
+  smoothed <- smoothr::smooth(contours, method = "ksmooth", smoothness = smoothness)
+  return(smoothed)
+}
+
+
